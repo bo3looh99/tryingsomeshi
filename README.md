@@ -132,8 +132,8 @@ If a file for today already exists, a counter suffix is added (`_2`, `_3`, …).
 ```json
 {
   "owner_profile": {
-    "username": "h_la7soooni",
-    "nickname": "H_la7soni",
+    "username": "hhiuhio",
+    "nickname": "huiohuioi",
     "uid": "6572191588984963077",
     "sec_uid": "MS4wLjABAAAA...",
     "region": "AE",
