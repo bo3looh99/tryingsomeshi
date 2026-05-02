@@ -1,21 +1,26 @@
 """
-TikTok DM Parser v6.0
+TikTok DM Parser v7.0
 ─────────────────────────────────────────────────────────────────────────────
-What's new vs v5:
-  • Profile scraper REMOVED
-  • Login retry loop (handles flaky first-attempt logins)
-  • Resume-from-crash: progress saved after every conversation
-  • Human-like behavior: jittered delays, randomized scrolls, periodic breaks
-  • Rate limit: 15–30 convos/hour (configurable), with extra long breaks
-  • Inbox count detection → ETA shown before scraping starts and after each convo
-  • Robust per-conversation error handling + error log file
-  • Slow-connection safe: waits for chat to stabilize before extracting
+What's new vs v6.1:
+  • Per-account output folder — everything related to one account (state,
+    avatars, JSON, optional media) lives in dms_<username>/
+  • Avatar capture from inbox list items, not chat header — fixes the
+    bleed-through bug where late conversations all shared one avatar
+  • Inbox count now from actual DOM enumeration (badge was inaccurate)
+  • Story-reaction detection now catches the "This message type isn't
+    supported. Download TikTok app to view this message." web placeholder
+  • Stronger sender (is_me) detection: class + data-e2e + computed style
+  • Stronger timestamp extraction: DOM selectors, attributes, in-text regex
+  • Optional --download-media flag — saves images/videos from chats locally
+  • Auto-detect your @username from the nav if --username isn't supplied
 
-Files written:
-  tiktok_dms_state.json       ← resume state (delete or use --reset to start over)
-  tiktok_dms_full_<date>.json ← final output (compatible with the viewer)
-  tiktok_dms_errors.log       ← per-convo error tracebacks
-  tiktok_avatars/             ← downloaded avatar images
+Output folder layout (auto-created, one per account):
+  dms_<username>/
+    tiktok_dms_full_<date>.json   ← final output
+    tiktok_dms_state.json         ← resume state
+    tiktok_dms_errors.log
+    tiktok_avatars/
+    tiktok_media/                 ← only created with --download-media
 """
 
 import argparse
@@ -44,29 +49,54 @@ _UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-_AVATAR_DIR    = "tiktok_avatars"
-_STATE_FILE    = "tiktok_dms_state.json"
-_OUTPUT_PREFIX = "tiktok_dms_full"
-_ERROR_LOG     = "tiktok_dms_errors.log"
-
 # ── Chromedriver: set if undetected-chromedriver's auto-download is flaky ───
 # Download a matching build from:
 #   https://googlechromelabs.github.io/chrome-for-testing/
 # Then put the absolute path below. Leave empty to let uc auto-fetch.
 _CHROMEDRIVER_PATH   = ""    # e.g. r"C:\drivers\chromedriver-win64\chromedriver.exe"
-_CHROME_VERSION_MAIN = 147   # Pin to your installed Chrome major version (you said 147)
+_CHROME_VERSION_MAIN = 147   # Pin to your installed Chrome major version
 
-# Rate limit: 15–30 convos/hr  →  120–240 s per convo
-_MIN_SECONDS_PER_CONVO = 120   # = 30/hr ceiling
-_MAX_SECONDS_PER_CONVO = 240   # = 15/hr floor
+# Rate limit: 15-30 convos/hr  →  120-240s per convo
+_MIN_SECONDS_PER_CONVO = 120
+_MAX_SECONDS_PER_CONVO = 240
 
-# Periodic "long break" every N convos (random N each time) to look human
 _LONG_BREAK_EVERY_MIN = 6
 _LONG_BREAK_EVERY_MAX = 10
-_LONG_BREAK_SECS_MIN  = 180    # 3 min
-_LONG_BREAK_SECS_MAX  = 420    # 7 min
+_LONG_BREAK_SECS_MIN  = 180
+_LONG_BREAK_SECS_MAX  = 420
 
 _LOGIN_MAX_ATTEMPTS = 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Output folder management — everything contained in one folder
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Paths:
+    """All output paths — set once in main() based on --username / detected."""
+    output_dir:    str = "."
+    state_file:    str = "tiktok_dms_state.json"
+    error_log:     str = "tiktok_dms_errors.log"
+    avatar_dir:    str = "tiktok_avatars"
+    media_dir:     str = "tiktok_media"
+    output_prefix: str = "tiktok_dms_full"
+
+    @classmethod
+    def init(cls, root: str):
+        cls.output_dir    = root
+        os.makedirs(root, exist_ok=True)
+        cls.state_file    = os.path.join(root, "tiktok_dms_state.json")
+        cls.error_log     = os.path.join(root, "tiktok_dms_errors.log")
+        cls.avatar_dir    = os.path.join(root, "tiktok_avatars")
+        cls.media_dir     = os.path.join(root, "tiktok_media")
+        cls.output_prefix = os.path.join(root, "tiktok_dms_full")
+
+
+def make_output_dir_name(username: str | None) -> str:
+    if username:
+        safe = re.sub(r"[^\w\-]", "_", username.lstrip("@"))
+        return f"dms_{safe}"
+    return f"dms_run_{datetime.now():%Y%m%d_%H%M%S}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,17 +104,14 @@ _LOGIN_MAX_ATTEMPTS = 5
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _jitter(lo=0.8, hi=2.2):
-    """Short human-like delay (clicks, small actions)."""
     time.sleep(random.uniform(lo, hi))
 
 
 def _think_pause(lo=3.0, hi=7.0):
-    """Longer pause between major actions (page nav, opening chats)."""
     time.sleep(random.uniform(lo, hi))
 
 
 def _take_break(seconds: float):
-    """Long break that prints a wake-up time so you can leave the screen."""
     if seconds <= 0:
         return
     eta = datetime.now() + timedelta(seconds=seconds)
@@ -95,7 +122,6 @@ def _take_break(seconds: float):
 
 
 def _human_scroll(driver, container=None, direction="up", times=1):
-    """Scroll with random pixel amounts and small pauses — feels human."""
     for _ in range(times):
         amount = random.randint(300, 1100)
         if direction == "up":
@@ -114,7 +140,7 @@ def _human_scroll(driver, container=None, direction="up", times=1):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Driver setup
+#  Driver
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_driver(headless: bool, proxy: str | None) -> uc.Chrome:
@@ -158,7 +184,7 @@ def build_driver(headless: bool, proxy: str | None) -> uc.Chrome:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Login (with retry)
+#  Login
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _looks_logged_in(driver) -> bool:
@@ -177,9 +203,58 @@ def _looks_logged_in(driver) -> bool:
         return False
 
 
+def detect_own_username(driver) -> str | None:
+    """Try several strategies to read the logged-in user's @handle."""
+    # Strategy 1: any /@username link in the nav
+    try:
+        for link in driver.find_elements(By.CSS_SELECTOR, "a[href*='/@']"):
+            href = link.get_attribute("href") or ""
+            if "/@" in href:
+                slug = href.split("/@")[-1].split("?")[0].split("/")[0].strip()
+                if slug and slug not in ("following", "followers", "explore",
+                                          "live", "discover", "tag"):
+                    return slug
+    except Exception:
+        pass
+
+    # Strategy 2: profile data-e2e nav element
+    try:
+        for el in driver.find_elements(By.CSS_SELECTOR, "[data-e2e='nav-profile']"):
+            href = el.get_attribute("href") or ""
+            if "/@" in href:
+                slug = href.split("/@")[-1].split("?")[0].split("/")[0].strip()
+                if slug:
+                    return slug
+    except Exception:
+        pass
+
+    # Strategy 3: parse global JS state (works on most TikTok pages)
+    try:
+        result = driver.execute_script("""
+            try {
+              const a = window.SIGI_STATE?.AppContext?.user?.uniqueId;
+              if (a) return a;
+              const b = window.__INITIAL_STATE__?.user?.uniqueId;
+              if (b) return b;
+              const link = document.querySelector('a[href*="/@"]');
+              if (link) {
+                const m = link.href.match(/\\/@([^\\/?]+)/);
+                if (m) return m[1];
+              }
+            } catch (e) {}
+            return null;
+        """)
+        if result and isinstance(result, str):
+            slug = result.strip().lstrip("@")
+            if slug:
+                return slug
+    except Exception:
+        pass
+
+    return None
+
+
 def _verify_profile_url(driver, username: str) -> bool:
-    """Optional extra verification — visit https://www.tiktok.com/@<username>
-    and check we land on a real profile (not a login wall / 404)."""
     url = f"https://www.tiktok.com/@{username.lstrip('@')}"
     try:
         driver.get(url)
@@ -187,7 +262,6 @@ def _verify_profile_url(driver, username: str) -> bool:
         cur = (driver.current_url or "").lower()
         if "/login" in cur:
             return False
-        # A real profile has these data-e2e attributes
         markers = driver.find_elements(
             By.CSS_SELECTOR,
             "[data-e2e='user-title'], [data-e2e='user-subtitle'], "
@@ -199,9 +273,6 @@ def _verify_profile_url(driver, username: str) -> bool:
 
 
 def login_with_retry(driver, sessionid: str, username: str | None = None) -> bool:
-    """Set cookie, navigate to /messages, verify. Retry several times.
-    If `username` is given, also confirm /@username loads — more reliable
-    than DOM heuristics."""
     for attempt in range(1, _LOGIN_MAX_ATTEMPTS + 1):
         print(f"\n🔐 Login attempt {attempt}/{_LOGIN_MAX_ATTEMPTS}...")
         try:
@@ -224,19 +295,17 @@ def login_with_retry(driver, sessionid: str, username: str | None = None) -> boo
             _think_pause(4, 7)
 
             driver.get("https://www.tiktok.com/messages")
-            _think_pause(7, 12)  # generous for slow connections
+            _think_pause(7, 12)
 
             ok = _looks_logged_in(driver)
 
-            # Stronger check: if username was given, confirm profile page loads
             if ok and username:
-                print(f"   🔎 Verifying /@{username}...")
+                print(f"   🔎 Verifying /@{username.lstrip('@')}...")
                 if _verify_profile_url(driver, username):
                     print("   ✅ Profile page loaded — login confirmed.")
                 else:
                     print("   ⚠️  Profile page didn't load — treating as failed login.")
                     ok = False
-                # Return to messages page either way
                 driver.get("https://www.tiktok.com/messages")
                 _think_pause(5, 9)
 
@@ -255,57 +324,45 @@ def login_with_retry(driver, sessionid: str, username: str | None = None) -> boo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Inbox count + ETA
+#  Inbox loading + count + ETA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_inbox_count(driver) -> int | None:
-    """
-    Try to read the total conversation count visible on the inbox tab/badge.
-    Returns None if we can't find it.
-    """
-    selectors = [
-        "[data-e2e='message-tab-count']",
-        "[data-e2e*='inbox'] [class*='Count']",
-        "[class*='TabCount']",
-        "[class*='Badge']",
-        "[class*='Count']",
-    ]
-    for sel in selectors:
-        try:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                txt = (el.text or "").strip()
-                m = re.search(r'(\d{1,5})', txt)
-                if m:
-                    n = int(m.group(1))
-                    if 0 < n < 10000:
-                        return n
-        except Exception:
-            continue
+def load_inbox(driver, max_passes: int = 60):
+    """Scroll until all conversation list items are loaded."""
+    prev = -1
+    stagnant = 0
+    for _ in range(max_passes):
+        _human_scroll(driver, times=1, direction="down")
+        _jitter(0.8, 1.6)
+        cur = len(driver.find_elements(
+            By.CSS_SELECTOR,
+            "div[class*='DivItemInfo'], div[role='listitem']"))
+        if cur == prev:
+            stagnant += 1
+            if stagnant >= 4:
+                break
+        else:
+            stagnant = 0
+        prev = cur
 
-    # Fallback: scan body text for "Messages (N)" / "Inbox 123" patterns
-    try:
-        body = driver.find_element(By.TAG_NAME, "body").text
-        m = re.search(
-            r'(?:Messages?|Inbox|Chats?|DMs?)\s*\(?\s*(\d{1,5})\s*\)?',
-            body, re.I,
-        )
-        if m:
-            return int(m.group(1))
-    except Exception:
-        pass
 
-    return None
+def count_loaded_conversations(driver) -> int:
+    """Actual count of conversation list items currently in DOM —
+    more reliable than the tab badge. Call after load_inbox()."""
+    return len(driver.find_elements(
+        By.CSS_SELECTOR,
+        "div[class*='DivItemInfo'], div[role='listitem']",
+    ))
 
 
 def print_eta(total: int | None, completed: int):
     if total is None:
         return
-    remaining = total - completed
+    remaining = max(0, total - completed)
     if remaining <= 0:
         print(f"   ⏱️  All {total} conversations done.")
         return
     avg = (_MIN_SECONDS_PER_CONVO + _MAX_SECONDS_PER_CONVO) / 2
-    # Account for periodic long breaks (~5 min every ~8 convos)
     breaks_secs = (remaining / 8) * 300
     seconds = remaining * avg + breaks_secs
     eta = datetime.now() + timedelta(seconds=seconds)
@@ -315,259 +372,7 @@ def print_eta(total: int | None, completed: int):
           f"finish ~{eta:%Y-%m-%d %H:%M}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Resume state
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    if not os.path.exists(_STATE_FILE):
-        return {"completed_usernames": [], "conversations": [], "started_at": None}
-    try:
-        with open(_STATE_FILE, encoding="utf-8") as f:
-            s = json.load(f)
-        s.setdefault("completed_usernames", [])
-        s.setdefault("conversations", [])
-        s.setdefault("started_at", None)
-        return s
-    except Exception as e:
-        print(f"⚠️  Could not load state ({e}) — starting fresh.")
-        return {"completed_usernames": [], "conversations": [], "started_at": None}
-
-
-def save_state(state: dict):
-    """Atomic write so a crash mid-write can't corrupt the file."""
-    tmp = _STATE_FILE + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, _STATE_FILE)
-    except Exception as e:
-        print(f"⚠️  Could not save state: {e}")
-
-
-def clear_state():
-    if os.path.exists(_STATE_FILE):
-        try:
-            os.remove(_STATE_FILE)
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Avatars
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _download_avatar(url: str, filename: str) -> str | None:
-    os.makedirs(_AVATAR_DIR, exist_ok=True)
-    safe = re.sub(r"[^\w\-]", "_", filename) + ".jpg"
-    path = os.path.join(_AVATAR_DIR, safe)
-    if os.path.exists(path):
-        return path
-    try:
-        r = requests.get(url, headers={"User-Agent": _UA}, timeout=20)
-        if r.status_code == 200:
-            with open(path, "wb") as f:
-                f.write(r.content)
-            return path
-    except Exception as e:
-        print(f"   ⚠️  Avatar download failed: {e}")
-    return None
-
-
-def _get_chat_avatar_url(driver) -> str | None:
-    header_selectors = [
-        "[data-e2e='chat-header'] img",
-        "[data-e2e='conversation-header'] img",
-        "[class*='DivChatHeader'] img",
-        "[class*='DivConversationHeader'] img",
-        "[class*='DivHeader'] img[class*='Avatar']",
-        "[class*='DivHeader'] img[class*='Img']",
-    ]
-    for sel in header_selectors:
-        try:
-            img = driver.find_element(By.CSS_SELECTOR, sel)
-            src = img.get_attribute("src") or ""
-            if src.startswith("http") and "tiktok" in src:
-                return src
-        except Exception:
-            continue
-    try:
-        imgs = driver.find_elements(By.CSS_SELECTOR, "img[class*='ImgAvatar']")
-        candidates = [
-            img.get_attribute("src") for img in imgs
-            if (img.get_attribute("src") or "").startswith("http")
-            and "tiktok" in (img.get_attribute("src") or "")
-        ]
-        if candidates:
-            return candidates[-1]
-    except Exception:
-        pass
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Chat extraction (slow-connection safe)
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Patterns commonly used by TikTok for "X reacted to your story" messages.
-# We only treat a message as a story reaction if there's NO real text alongside.
-_STORY_REACTION_PATTERNS = [
-    re.compile(r'reacted (?:to )?(?:your |an? )?story', re.I),
-    re.compile(r'replied to (?:your )?story', re.I),
-    re.compile(r"^story\s*[:\-]", re.I),
-    re.compile(r'^\W*(?:liked|loved|❤|😂|🔥|😮|😢|🙏|👏)\W*$'),  # bare emoji-only
-]
-
-
-def _classify_message(text: str, msg_element) -> str:
-    """Return one of: 'text', 'story_reaction', 'shared_post', 'media', 'system'."""
-    tl = (text or "").strip()
-
-    # Story reaction patterns — text is usually short or template-like
-    for pat in _STORY_REACTION_PATTERNS:
-        if pat.search(tl):
-            return "story_reaction"
-
-    # DOM-based hints for media / shared content
-    try:
-        if msg_element.find_elements(
-            By.CSS_SELECTOR,
-            "video, img[class*='Img']:not([class*='Avatar']), "
-            "[class*='SharedPost'], [class*='SharedVideo']",
-        ):
-            # Differentiate shared TikTok posts from plain media
-            if msg_element.find_elements(
-                By.CSS_SELECTOR,
-                "[class*='Shared'], a[href*='/video/']",
-            ):
-                return "shared_post"
-            return "media"
-    except Exception:
-        pass
-
-    # System messages (joined / left / blocked etc.)
-    if re.search(r'^(?:You|This account|User) (?:can|cannot|blocked|has)', tl, re.I):
-        return "system"
-
-    return "text" if tl else "media"
-
-
-def _wait_for_chat_loaded(driver, timeout: int = 35) -> bool:
-    """
-    Wait until the chat container has settled — i.e. the message count
-    stops changing for several consecutive checks. Crucial on slow networks
-    so we don't grab a half-loaded chat.
-    """
-    end = time.time() + timeout
-    last_count = -1
-    stable = 0
-    while time.time() < end:
-        try:
-            n = len(driver.find_elements(
-                By.CSS_SELECTOR, "div[data-e2e*='message']"))
-            if n > 0 and n == last_count:
-                stable += 1
-                if stable >= 3:
-                    return True
-            else:
-                stable = 0
-            last_count = n
-        except Exception:
-            pass
-        time.sleep(1.0)
-    return last_count > 0
-
-
-def extract_chat_history(driver, scroll_times: int = 15) -> list:
-    messages: list = []
-    try:
-        WebDriverWait(driver, 25).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body")))
-
-        if not _wait_for_chat_loaded(driver, timeout=40):
-            print("   ⚠️  Chat did not stabilize in time — continuing anyway")
-
-        chat_container = None
-        try:
-            chat_container = driver.find_element(
-                By.CSS_SELECTOR, "div[class*='DivMessage']")
-            print("   ✅ Chat container found")
-        except Exception:
-            print("   ⚠️  Chat container missing — falling back to window scroll")
-
-        print(f"   📜 Scrolling up (max {scroll_times} passes)...")
-        prev_count = -1
-        stagnant = 0
-        for _ in range(scroll_times):
-            _human_scroll(
-                driver,
-                container=chat_container,
-                direction="up",
-                times=1,
-            )
-            time.sleep(random.uniform(2.0, 3.5))
-
-            cur = len(driver.find_elements(
-                By.CSS_SELECTOR, "div[data-e2e*='message']"))
-            if cur == prev_count:
-                stagnant += 1
-                if stagnant >= 4:
-                    print(f"   ✅ History fully loaded ({cur} nodes)")
-                    break
-            else:
-                stagnant = 0
-            prev_count = cur
-
-        msg_elements = driver.find_elements(
-            By.CSS_SELECTOR, "div[data-e2e*='message']")
-        print(f"   ✅ {len(msg_elements)} message nodes")
-
-        for msg in msg_elements:
-            try:
-                text = msg.text.strip()
-                if not text:
-                    continue
-                classes = msg.get_attribute("class") or ""
-                is_me = any(
-                    k in classes.lower()
-                    for k in ("right", "my", "self", "sender-me"))
-
-                timestamp = ""
-                time_elems = msg.find_elements(
-                    By.CSS_SELECTOR, "span[class*='time'], small")
-                if time_elems:
-                    timestamp = time_elems[0].text.strip()
-
-                msg_type = _classify_message(text, msg)
-
-                messages.append({
-                    "is_me":             is_me,
-                    "sender":            "Me" if is_me else "Them",
-                    "text":              text,
-                    "timestamp":         timestamp or "—",
-                    "message_type":      msg_type,
-                    "is_story_reaction": msg_type == "story_reaction",
-                })
-            except Exception:
-                continue
-
-    except Exception as e:
-        print(f"   ⚠️  Chat extraction issue: {e}")
-
-    # Stats so it's visible in the log what's text vs reactions vs media
-    counts: dict[str, int] = {}
-    for m in messages:
-        counts[m["message_type"]] = counts.get(m["message_type"], 0) + 1
-    print(f"   ✅ Extracted {len(messages)} messages — {counts}")
-    return messages
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Inbox loading
-# ─────────────────────────────────────────────────────────────────────────────
-
 def open_requests_tab(driver) -> bool:
-    """Open the Message Requests folder. Returns True if we got there."""
     print("\n📂 Opening Message Requests folder...")
     selectors = [
         "[data-e2e='message-requests']",
@@ -590,7 +395,6 @@ def open_requests_tab(driver) -> bool:
         except Exception:
             continue
 
-    # Fallback: text-based search across clickable elements
     try:
         for el in driver.find_elements(By.XPATH, "//*[contains(text(), 'Request')]"):
             try:
@@ -608,37 +412,454 @@ def open_requests_tab(driver) -> bool:
 
 
 def return_to_main_inbox(driver):
-    """Navigate back to the regular messages inbox."""
     driver.get("https://www.tiktok.com/messages")
     _think_pause(5, 9)
 
 
-def load_inbox(driver, max_passes: int = 40):
-    """Scroll the inbox sidebar so all conversations are in the DOM."""
-    prev = -1
-    stagnant = 0
-    for _ in range(max_passes):
-        _human_scroll(driver, times=1, direction="down")
-        _jitter(0.8, 1.6)
-        cur = len(driver.find_elements(
-            By.CSS_SELECTOR,
-            "div[class*='DivItemInfo'], div[role='listitem']"))
-        if cur == prev:
-            stagnant += 1
-            if stagnant >= 4:
-                break
-        else:
-            stagnant = 0
-        prev = cur
+# ─────────────────────────────────────────────────────────────────────────────
+#  Resume state
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    if not os.path.exists(Paths.state_file):
+        return {"completed_usernames": [], "conversations": [], "started_at": None}
+    try:
+        with open(Paths.state_file, encoding="utf-8") as f:
+            s = json.load(f)
+        s.setdefault("completed_usernames", [])
+        s.setdefault("conversations", [])
+        s.setdefault("started_at", None)
+        return s
+    except Exception as e:
+        print(f"⚠️  Could not load state ({e}) — starting fresh.")
+        return {"completed_usernames": [], "conversations": [], "started_at": None}
+
+
+def save_state(state: dict):
+    tmp = Paths.state_file + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, Paths.state_file)
+    except Exception as e:
+        print(f"⚠️  Could not save state: {e}")
+
+
+def clear_state():
+    if os.path.exists(Paths.state_file):
+        try:
+            os.remove(Paths.state_file)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Errors → log file
+#  Avatars
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_list_item_avatar_url(item) -> str | None:
+    """Get the avatar URL from a conversation list item BEFORE clicking it.
+    Fixes the bleed-through bug where the chat header sometimes still showed
+    the previous conversation's avatar."""
+    try:
+        for sel in (
+            "img[class*='Avatar']",
+            "img[class*='ImgAvatar']",
+            "img[class*='Img']",
+            "img",
+        ):
+            for img in item.find_elements(By.CSS_SELECTOR, sel):
+                src = img.get_attribute("src") or ""
+                if src.startswith("http") and "tiktok" in src:
+                    return src
+    except Exception:
+        pass
+    return None
+
+
+def _download_avatar(url: str, filename: str) -> str | None:
+    os.makedirs(Paths.avatar_dir, exist_ok=True)
+    safe = re.sub(r"[^\w\-]", "_", filename) + ".jpg"
+    path = os.path.join(Paths.avatar_dir, safe)
+    if os.path.exists(path):
+        return path
+    try:
+        r = requests.get(url, headers={"User-Agent": _UA}, timeout=20)
+        if r.status_code == 200:
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return path
+    except Exception as e:
+        print(f"   ⚠️  Avatar download failed: {e}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Media (--download-media)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_media_from_message(msg_element) -> list[dict]:
+    """Return [{type, url}] for downloadable media inside this message element."""
+    media = []
+    seen = set()
+    try:
+        for img in msg_element.find_elements(
+            By.CSS_SELECTOR,
+            "img:not([class*='Avatar']):not([class*='Emoji'])",
+        ):
+            src = img.get_attribute("src") or ""
+            if src.startswith("http") and not src.endswith(".svg") and src not in seen:
+                seen.add(src)
+                media.append({"type": "image", "url": src})
+    except Exception:
+        pass
+    try:
+        for vid in msg_element.find_elements(By.CSS_SELECTOR, "video"):
+            src = vid.get_attribute("src") or ""
+            if not src:
+                try:
+                    src = vid.find_element(By.TAG_NAME, "source").get_attribute("src") or ""
+                except Exception:
+                    pass
+            if src.startswith("http") and src not in seen:
+                seen.add(src)
+                media.append({"type": "video", "url": src})
+    except Exception:
+        pass
+    return media
+
+
+def _download_media_file(url: str, dest_dir: str, prefix: str) -> str | None:
+    os.makedirs(dest_dir, exist_ok=True)
+    base = url.split("?")[0]
+    last_seg = base.rsplit("/", 1)[-1]
+    ext = last_seg.rsplit(".", 1)[-1].lower() if "." in last_seg else "bin"
+    if ext not in ("jpg", "jpeg", "png", "webp", "gif", "mp4", "mov", "webm", "m4v"):
+        ext = "bin"
+    safe_prefix = re.sub(r"[^\w\-]", "_", prefix)[:80]
+    fname = f"{safe_prefix}_{abs(hash(url)) % 10**8}.{ext}"
+    path = os.path.join(dest_dir, fname)
+    if os.path.exists(path):
+        return path
+    try:
+        r = requests.get(
+            url,
+            headers={"User-Agent": _UA, "Referer": "https://www.tiktok.com/"},
+            timeout=60,
+            stream=True,
+        )
+        if r.status_code == 200:
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    f.write(chunk)
+            return path
+        print(f"   ⚠️  Media HTTP {r.status_code} for {url[:80]}")
+    except Exception as e:
+        print(f"   ⚠️  Media download failed: {e}")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Message classification + timestamp extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STORY_REACTION_PATTERNS = [
+    re.compile(r"reacted (?:to )?(?:your |an? )?story", re.I),
+    re.compile(r"replied to (?:your )?story", re.I),
+    re.compile(r"^story\s*[:\-]", re.I),
+]
+
+# TikTok web's placeholder for messages it can't render (story reactions,
+# certain media, etc.). We treat these as story_reaction so the viewer
+# doesn't display the "Download TikTok app" garbage to the user.
+_UNSUPPORTED_PLACEHOLDERS = (
+    "this message type isn't supported",
+    "this message type isn’t supported",  # curly apostrophe
+    "download tiktok app to view this message",
+    "download tiktok app",
+)
+
+
+def _classify_message(text: str, msg_element) -> str:
+    """Return one of: 'text', 'story_reaction', 'shared_post', 'media', 'system'."""
+    tl = (text or "").strip()
+    tl_lower = tl.lower()
+
+    for marker in _UNSUPPORTED_PLACEHOLDERS:
+        if marker in tl_lower:
+            return "story_reaction"
+
+    for pat in _STORY_REACTION_PATTERNS:
+        if pat.search(tl):
+            return "story_reaction"
+
+    try:
+        if msg_element.find_elements(
+            By.CSS_SELECTOR,
+            "video, img[class*='Img']:not([class*='Avatar']), "
+            "[class*='SharedPost'], [class*='SharedVideo']",
+        ):
+            if msg_element.find_elements(
+                By.CSS_SELECTOR,
+                "[class*='Shared'], a[href*='/video/']",
+            ):
+                return "shared_post"
+            return "media"
+    except Exception:
+        pass
+
+    if re.search(r'^(?:You|This account|User) (?:can|cannot|blocked|has)', tl, re.I):
+        return "system"
+
+    return "text" if tl else "media"
+
+
+# Match a date/time embedded in TikTok's per-message text, e.g.:
+#   "Apr 27, 2026 10:30 AM"  /  "10:30 AM"  /  "Yesterday 14:05"
+_TIMESTAMP_REGEX = re.compile(
+    r"(?:\b[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4}(?:[\s,]+\d{1,2}:\d{2}(?:\s*[AP]M)?)?"
+    r"|\b\d{1,2}:\d{2}\s*(?:AM|PM)?\b)",
+    re.I,
+)
+
+
+def _extract_timestamp(msg_element, text: str) -> str:
+    # 1. timestamp element by class / data-e2e
+    for sel in (
+        "[class*='Timestamp']",
+        "[class*='TimeStamp']",
+        "[data-e2e*='time']",
+        "[class*='MessageTime']",
+        "[class*='Time']",
+        "span[class*='time']",
+        "small",
+        "time",
+    ):
+        try:
+            for el in msg_element.find_elements(By.CSS_SELECTOR, sel):
+                t = (el.text or "").strip()
+                if t and re.search(r"\d", t):
+                    return t
+        except Exception:
+            continue
+
+    # 2. tooltip / aria-label on the message itself
+    for attr in ("title", "aria-label", "data-tooltip"):
+        try:
+            v = msg_element.get_attribute(attr) or ""
+            if v and re.search(r"\d{1,2}:\d{2}", v):
+                return v.strip()
+        except Exception:
+            pass
+
+    # 3. embedded in the visible text
+    if text:
+        m = _TIMESTAMP_REGEX.search(text)
+        if m:
+            return m.group(0).strip()
+
+    return ""
+
+
+def _strip_timestamp_from_text(text: str, ts: str) -> str:
+    if not ts or ts not in text:
+        return text
+    return text.replace(ts, "").strip()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Chat extraction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _wait_for_chat_loaded(driver, timeout: int = 35) -> bool:
+    end = time.time() + timeout
+    last_count = -1
+    stable = 0
+    while time.time() < end:
+        try:
+            n = len(driver.find_elements(
+                By.CSS_SELECTOR, "div[data-e2e*='message']"))
+            if n > 0 and n == last_count:
+                stable += 1
+                if stable >= 3:
+                    return True
+            else:
+                stable = 0
+            last_count = n
+        except Exception:
+            pass
+        time.sleep(1.0)
+    return last_count > 0
+
+
+def _wait_for_chat_username(driver, expected: str, timeout: int = 10) -> bool:
+    """Wait for the chat header to reflect the conversation we just opened —
+    extra defense against the avatar bleed-through bug."""
+    end = time.time() + timeout
+    expected_l = (expected or "").lower()
+    if not expected_l:
+        return False
+    while time.time() < end:
+        try:
+            for sel in ("[data-e2e='chat-header']",
+                         "[data-e2e='conversation-header']",
+                         "[class*='DivChatHeader']",
+                         "[class*='DivConversationHeader']",
+                         "[class*='DivHeader']"):
+                for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                    if expected_l in (el.text or "").lower():
+                        return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _detect_is_me(driver, msg, classes: str) -> bool:
+    """Multi-strategy is_me detection. Returns True if message is from owner."""
+    cl = classes.lower()
+    if any(k in cl for k in ("right", "my", "self", "sender-me", "outgoing")):
+        return True
+
+    try:
+        e2e = (msg.get_attribute("data-e2e") or "").lower()
+        if any(k in e2e for k in ("self", "outgoing", "right", "-me")):
+            return True
+    except Exception:
+        pass
+
+    # Computed style — right-aligned bubbles are usually "me"
+    try:
+        result = driver.execute_script("""
+            const el = arguments[0];
+            const cs = window.getComputedStyle(el);
+            if (cs.alignSelf === 'flex-end') return true;
+            if (cs.marginLeft === 'auto' && cs.marginRight !== 'auto') return true;
+            const parent = el.parentElement;
+            if (parent) {
+              const pcs = window.getComputedStyle(parent);
+              if (pcs.justifyContent === 'flex-end') return true;
+            }
+            return false;
+        """, msg)
+        if result:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def extract_chat_history(driver, scroll_times: int, download_media: bool,
+                          username: str) -> tuple[list, list]:
+    """Returns (messages, media_records).
+    media_records: [{message_index, type, url, local_path?}]"""
+    messages: list = []
+    media_records: list = []
+
+    try:
+        WebDriverWait(driver, 25).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        if not _wait_for_chat_loaded(driver, timeout=40):
+            print("   ⚠️  Chat did not stabilize — continuing anyway")
+
+        chat_container = None
+        try:
+            chat_container = driver.find_element(
+                By.CSS_SELECTOR, "div[class*='DivMessage']")
+            print("   ✅ Chat container found")
+        except Exception:
+            print("   ⚠️  Chat container missing — falling back to window scroll")
+
+        print(f"   📜 Scrolling up (max {scroll_times} passes)...")
+        prev_count = -1
+        stagnant = 0
+        for _ in range(scroll_times):
+            _human_scroll(driver, container=chat_container,
+                          direction="up", times=1)
+            time.sleep(random.uniform(2.0, 3.5))
+            cur = len(driver.find_elements(
+                By.CSS_SELECTOR, "div[data-e2e*='message']"))
+            if cur == prev_count:
+                stagnant += 1
+                if stagnant >= 4:
+                    print(f"   ✅ History fully loaded ({cur} nodes)")
+                    break
+            else:
+                stagnant = 0
+            prev_count = cur
+
+        msg_elements = driver.find_elements(
+            By.CSS_SELECTOR, "div[data-e2e*='message']")
+        print(f"   ✅ {len(msg_elements)} message nodes")
+
+        for msg in msg_elements:
+            try:
+                raw_text = (msg.text or "").strip()
+                classes = msg.get_attribute("class") or ""
+
+                is_me = _detect_is_me(driver, msg, classes)
+                timestamp = _extract_timestamp(msg, raw_text)
+                cleaned_text = _strip_timestamp_from_text(raw_text, timestamp)
+                msg_type = _classify_message(cleaned_text, msg)
+
+                # If body was nothing but a placeholder, blank the text out
+                final_text = cleaned_text
+                if msg_type == "story_reaction":
+                    fl = final_text.lower()
+                    if any(p in fl for p in _UNSUPPORTED_PLACEHOLDERS):
+                        final_text = ""
+
+                media_in_msg = _extract_media_from_message(msg) if download_media else []
+
+                # Skip pure noise (no text, no media, plain "text" type)
+                if not final_text and msg_type == "text" and not media_in_msg:
+                    continue
+
+                messages.append({
+                    "is_me":             is_me,
+                    "sender":            "Me" if is_me else "Them",
+                    "text":              final_text,
+                    "raw_text":          raw_text,
+                    "timestamp":         timestamp or "",
+                    "message_type":      msg_type,
+                    "is_story_reaction": msg_type == "story_reaction",
+                    "media":             [
+                        {"type": m["type"], "url": m["url"]}
+                        for m in media_in_msg
+                    ],
+                })
+                if media_in_msg:
+                    msg_index = len(messages) - 1
+                    for m in media_in_msg:
+                        media_records.append({
+                            "message_index": msg_index,
+                            "type":          m["type"],
+                            "url":           m["url"],
+                        })
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"   ⚠️  Chat extraction issue: {e}")
+
+    counts: dict[str, int] = {}
+    for m in messages:
+        counts[m["message_type"]] = counts.get(m["message_type"], 0) + 1
+    print(f"   ✅ Extracted {len(messages)} messages — {counts}")
+    if media_records:
+        print(f"   🎞️  {len(media_records)} media items found in this chat")
+    return messages, media_records
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Errors → log
 # ─────────────────────────────────────────────────────────────────────────────
 
 def log_error(username: str, exc: Exception):
     try:
-        with open(_ERROR_LOG, "a", encoding="utf-8") as f:
+        with open(Paths.error_log, "a", encoding="utf-8") as f:
             f.write(f"\n[{datetime.now().isoformat()}] {username}: {exc}\n")
             f.write(traceback.format_exc())
     except Exception:
@@ -646,32 +867,24 @@ def log_error(username: str, exc: Exception):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Main scrape loop (with resume + rate limit + ETA)
+#  Main scrape loop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _scrape_current_folder(driver, source: str, max_convos: int,
-                            chat_scrolls: int, state: dict,
-                            completed: set, out_convos: list,
+                            chat_scrolls: int, download_media: bool,
+                            state: dict, completed: set, out_convos: list,
                             counters: dict) -> None:
-    """
-    Scrape conversations in the currently-open folder (inbox OR requests).
-    Mutates `completed`, `out_convos`, `counters` in place.
-    `counters` keys: last_convo_at, processed_this_run, next_long_break_at, total.
-    """
     print(f"\n📁 Scraping folder: {source}")
     print("📜 Loading folder list...")
     load_inbox(driver)
 
-    # Try to detect count (may differ between inbox & requests)
-    folder_total = detect_inbox_count(driver)
-    if folder_total is not None:
-        print(f"📊 Folder reports {folder_total} conversations.")
+    folder_total = count_loaded_conversations(driver)
+    print(f"📊 {folder_total} conversations enumerated in {source}.")
 
     limit = max_convos if max_convos > 0 else 9999
     i = 0
 
     while i < limit:
-        # Re-find every iteration to avoid stale references
         conv_items = driver.find_elements(
             By.CSS_SELECTOR,
             "div[class*='DivItemInfo'], div[role='listitem']")
@@ -680,24 +893,25 @@ def _scrape_current_folder(driver, source: str, max_convos: int,
             print(f"\n   All {len(conv_items)} listed conversations processed.")
             break
 
-        # Resolve username before clicking, so we can skip if already done
+        # Resolve username + grab avatar URL FROM THE LIST ITEM, before clicking
         username = f"conv_{i+1}"
+        list_avatar_url = None
         try:
             raw = (conv_items[i].text or "").strip()
             lines = [l.strip() for l in raw.split("\n") if l.strip()]
             if lines:
                 username = lines[0]
+            list_avatar_url = _get_list_item_avatar_url(conv_items[i])
         except Exception:
             pass
 
-        # Tag with folder so we can distinguish inbox vs requests later
         tagged_key = f"{source}:{username}"
         if tagged_key in completed or username in completed:
             print(f"⏭️  [{i+1}] Skipping (already done) → {username} [{source}]")
             i += 1
             continue
 
-        # Rate limit: enforce minimum gap since previous convo
+        # Rate limit
         if counters["last_convo_at"]:
             elapsed = time.time() - counters["last_convo_at"]
             target = random.uniform(_MIN_SECONDS_PER_CONVO,
@@ -705,7 +919,7 @@ def _scrape_current_folder(driver, source: str, max_convos: int,
             if elapsed < target:
                 _take_break(target - elapsed)
 
-        # Periodic long break to look human
+        # Periodic long break
         if (counters["processed_this_run"] > 0
                 and counters["processed_this_run"] >= counters["next_long_break_at"]):
             print(f"\n   🌙 Periodic long break (after "
@@ -720,7 +934,6 @@ def _scrape_current_folder(driver, source: str, max_convos: int,
         try:
             print(f"\n📨 [{i+1}] Opening → {username} [{source}]")
 
-            # Re-find immediately before clicking to dodge stale references
             conv_items = driver.find_elements(
                 By.CSS_SELECTOR,
                 "div[class*='DivItemInfo'], div[role='listitem']")
@@ -731,36 +944,59 @@ def _scrape_current_folder(driver, source: str, max_convos: int,
             conv_items[i].click()
             _think_pause(5, 9)
 
-            messages = extract_chat_history(driver, chat_scrolls)
+            # Defend against bleed-through: wait for header to actually update
+            _wait_for_chat_username(driver, username, timeout=10)
 
-            avatar_url  = _get_chat_avatar_url(driver)
+            messages, media_records = extract_chat_history(
+                driver, chat_scrolls, download_media, username,
+            )
+
+            # Avatar — prefer the URL captured from the list item
+            avatar_url = list_avatar_url
             avatar_path = None
             if avatar_url:
                 avatar_path = _download_avatar(avatar_url, username)
                 if avatar_path:
                     print(f"   🖼️  Avatar → {avatar_path}")
 
-            # Per-convo summary by message_type
+            if download_media and media_records:
+                downloaded = 0
+                for rec in media_records:
+                    local = _download_media_file(
+                        rec["url"], Paths.media_dir,
+                        f"{username}_{rec['type']}_{rec['message_index']}",
+                    )
+                    rec["local_path"] = local
+                    msg_idx = rec["message_index"]
+                    if 0 <= msg_idx < len(messages):
+                        for media_item in messages[msg_idx]["media"]:
+                            if media_item["url"] == rec["url"]:
+                                media_item["local_path"] = local
+                                break
+                    if local:
+                        downloaded += 1
+                print(f"   📥 Downloaded {downloaded}/{len(media_records)} media files")
+
             type_counts: dict[str, int] = {}
             for m in messages:
                 t = m.get("message_type", "text")
                 type_counts[t] = type_counts.get(t, 0) + 1
 
             convo = {
-                "username":           username,
-                "source":             source,        # "inbox" | "requests"
-                "is_request":         source == "requests",
-                "avatar_url":         avatar_url,
-                "avatar_path":        avatar_path,
-                "messages":           messages,
-                "message_count":      len(messages),
+                "username":            username,
+                "source":              source,
+                "is_request":          source == "requests",
+                "avatar_url":          avatar_url,
+                "avatar_path":         avatar_path,
+                "messages":            messages,
+                "message_count":       len(messages),
                 "message_type_counts": type_counts,
-                "scraped_at":         datetime.now().isoformat(),
+                "media_count":         len(media_records),
+                "scraped_at":          datetime.now().isoformat(),
             }
             out_convos.append(convo)
             completed.add(tagged_key)
 
-            # Persist after every conversation — this is the resume point
             state["completed_usernames"] = sorted(completed)
             state["conversations"]      = out_convos
             save_state(state)
@@ -769,7 +1005,6 @@ def _scrape_current_folder(driver, source: str, max_convos: int,
             counters["last_convo_at"] = time.time()
             counters["processed_this_run"] += 1
 
-            # Back to the SAME folder we're scraping (inbox or requests)
             return_to_main_inbox(driver)
             if source == "requests":
                 open_requests_tab(driver)
@@ -796,19 +1031,15 @@ def _scrape_current_folder(driver, source: str, max_convos: int,
 
 
 def run_full_scraper(driver, max_convos: int, chat_scrolls: int,
-                      state: dict, include_requests: bool = False) -> list:
-    """Scrape main inbox, then optionally the Message Requests folder."""
+                      download_media: bool, state: dict,
+                      include_requests: bool = False) -> list:
     completed: set = set(state.get("completed_usernames", []))
     out_convos: list = list(state.get("conversations", []))
 
-    # Detect total count from the main inbox first (drives the ETA)
     return_to_main_inbox(driver)
     load_inbox(driver)
-    total = detect_inbox_count(driver)
-    if total is not None:
-        print(f"📊 Inbox tab reports {total} total conversations.")
-    else:
-        print("📊 Couldn't detect total count — ETA disabled.")
+    total = count_loaded_conversations(driver)
+    print(f"📊 {total} total conversations enumerated in main inbox.")
     print_eta(total, len(completed))
 
     counters = {
@@ -819,18 +1050,16 @@ def run_full_scraper(driver, max_convos: int, chat_scrolls: int,
         "total":              total,
     }
 
-    # ── Main inbox ────────────────────────────────────────────────────────
     _scrape_current_folder(
-        driver, "inbox", max_convos, chat_scrolls,
+        driver, "inbox", max_convos, chat_scrolls, download_media,
         state, completed, out_convos, counters,
     )
 
-    # ── Message Requests (optional) ───────────────────────────────────────
     if include_requests:
         return_to_main_inbox(driver)
         if open_requests_tab(driver):
             _scrape_current_folder(
-                driver, "requests", max_convos, chat_scrolls,
+                driver, "requests", max_convos, chat_scrolls, download_media,
                 state, completed, out_convos, counters,
             )
         else:
@@ -845,25 +1074,23 @@ def run_full_scraper(driver, max_convos: int, chat_scrolls: int,
 
 def build_output_path() -> str:
     base = datetime.now().strftime("%Y-%m-%d")
-    path = f"{_OUTPUT_PREFIX}_{base}.json"
+    path = f"{Paths.output_prefix}_{base}.json"
     if not os.path.exists(path):
         return path
     for n in range(2, 200):
-        candidate = f"{_OUTPUT_PREFIX}_{base}_{n}.json"
+        candidate = f"{Paths.output_prefix}_{base}_{n}.json"
         if not os.path.exists(candidate):
             return candidate
     return path
 
 
 def save_to_json(conversations: list, username: str | None = None) -> str:
-    """Viewer expects {owner_profile, conversations}. We only fill in username
-    if the user passed one via --username (no auto profile scraping)."""
     owner_profile: dict = {}
     if username:
         owner_profile["username"] = username.lstrip("@")
 
-    # Roll-up summary so it's easy to see at a glance
-    summary = {"inbox": 0, "requests": 0, "story_reactions": 0}
+    summary = {"inbox": 0, "requests": 0, "story_reactions": 0,
+               "media_items": 0}
     for c in conversations:
         if c.get("source") == "requests":
             summary["requests"] += 1
@@ -872,6 +1099,7 @@ def save_to_json(conversations: list, username: str | None = None) -> str:
         for m in c.get("messages", []):
             if m.get("is_story_reaction"):
                 summary["story_reactions"] += 1
+            summary["media_items"] += len(m.get("media", []))
 
     output = {
         "owner_profile": owner_profile,
@@ -892,14 +1120,17 @@ def save_to_json(conversations: list, username: str | None = None) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TikTok DM Parser v6.1 — resume · rate-limited · stealth")
+        description="TikTok DM Parser v7.0 — per-account folder · resume · stealth")
     parser.add_argument("--sessionid",        required=True,
                         help="TikTok sessionid cookie value")
     parser.add_argument("--username",         default=None,
-                        help="Your TikTok @handle (optional, e.g. 'someone' or "
-                             "'@someone'). Used to build "
-                             "https://www.tiktok.com/@<username> for stronger "
-                             "login verification, and stored in the output.")
+                        help="Your TikTok @handle (optional). Used for stronger "
+                             "login verification, picks the output folder name "
+                             "(dms_<username>/), and stored in the JSON. If "
+                             "omitted, the script tries to auto-detect from nav.")
+    parser.add_argument("--output-dir",       default=None,
+                        help="Override output folder (default: dms_<username> "
+                             "or dms_run_<timestamp>)")
     parser.add_argument("--headless",         action="store_true")
     parser.add_argument("--proxy",            default=None,
                         help="host:port  or  user:pass@host:port")
@@ -908,13 +1139,18 @@ def main():
     parser.add_argument("--chat-scrolls",     type=int, default=15)
     parser.add_argument("--include-requests", action="store_true",
                         help="Also scrape the Message Requests folder")
+    parser.add_argument("--download-media",   action="store_true",
+                        help="Download images / videos found in conversations "
+                             "into <output_dir>/tiktok_media/")
     parser.add_argument("--reset",            action="store_true",
                         help="Wipe saved state and start over")
     args = parser.parse_args()
 
-    print("🚀 TikTok DM Parser v6.1")
-    if args.username:
-        print(f"👤 Username: @{args.username.lstrip('@')}")
+    print("🚀 TikTok DM Parser v7.0")
+
+    initial_dir = args.output_dir or make_output_dir_name(args.username)
+    Paths.init(initial_dir)
+    print(f"📁 Output folder: {Paths.output_dir}")
 
     if args.reset:
         clear_state()
@@ -929,15 +1165,40 @@ def main():
 
     driver = build_driver(args.headless, args.proxy)
     conversations: list = list(state.get("conversations", []))
+    final_username = args.username
 
     try:
         if not login_with_retry(driver, args.sessionid, args.username):
             print("❌ Login failed after retries. State preserved — try again later.")
             return
 
+        # Auto-detect username (still saved into the JSON even if --output-dir
+        # was given, so the viewer can show "you")
+        if not args.username:
+            detected = detect_own_username(driver)
+            if detected:
+                print(f"🔍 Detected your @username from nav: @{detected}")
+                final_username = detected
+                if not args.output_dir:
+                    new_dir = make_output_dir_name(detected)
+                    if new_dir != Paths.output_dir:
+                        print(f"📁 Using detected username for output folder: {new_dir}")
+                        Paths.init(new_dir)
+                        # Reload state from the new folder (likely empty).
+                        # Old temp folder is left in place; user can delete.
+                        state = load_state()
+                        conversations = list(state.get("conversations", []))
+                        if not state.get("started_at"):
+                            state["started_at"] = datetime.now().isoformat()
+                            save_state(state)
+            else:
+                print("ℹ️  Couldn't auto-detect username; output stays in current folder.")
+
+        return_to_main_inbox(driver)
+
         conversations = run_full_scraper(
-            driver, args.max_convos, args.chat_scrolls, state,
-            include_requests=args.include_requests,
+            driver, args.max_convos, args.chat_scrolls, args.download_media,
+            state, include_requests=args.include_requests,
         )
 
     except KeyboardInterrupt:
@@ -952,7 +1213,7 @@ def main():
             pass
 
     if conversations:
-        save_to_json(conversations, username=args.username)
+        save_to_json(conversations, username=final_username)
     else:
         print("ℹ️  Nothing to save this run.")
 
